@@ -246,7 +246,7 @@ sub load_configs {
     push @configs, "/etc/jira-cli.yml" if -f "/etc/jira-cli.yml";
     for my $c ( reverse @configs ) {
         my $conf = -x $c ? YAML::Syck::Load(qx{$c}) : YAML::Syck::LoadFile($c);
-        for my $key ( %$conf ) {
+        for my $key ( keys %$conf ) {
             $config->{$key} = $conf->{$key};
         }
     }
