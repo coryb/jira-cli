@@ -12,29 +12,42 @@ use HTTP::Request;
 use HTTP::Headers;
 use HTTP::Cookies;
 
-my %opts = (
+my %config = (
     type => 'Bug',
     user => $ENV{USER},
+    editor => $ENV{JIRA_EDITOR} || $ENV{EDITOR} || "vi",
     baseuri => "http://jira",
+    priority => "Minor",
 );
 
-my %overrides = ();
+load_configs(\%config);
+
+my %opts;
+
 GetOptions(
-    'project=s'     => \$overrides{project},
-    'component=s'   => \$overrides{component},
-    'type=s'        => \$overrides{type},
-    'user=s'        => \$overrides{user},
-    'summary=s'     => \$overrides{summary},
-    'description=s' => \$overrides{description},
+    'project=s'     => \$config{project},
+    'component=s'   => \$config{component},
+    'type=s'        => \$config{type},
+    'user=s'        => \$config{user},
+    'reporter=s'    => \$config{reporter},
+    'assignee=s'    => \$config{assignee},
+    'summary=s'     => \$config{summary},
+    'description=s' => \$config{description},
+    'priority=s'    => \$config{priority},
+
+    'dryrun'        => \$opts{dryrun},
+    'edit!'         => \$opts{edit},
 );
 
-load_configs(\%opts);
-while( my ($k,$v) = each %overrides ) {
-    $opts{$k} = $v if defined $v;
-    if( ! defined $opts{$k} ) {
-        $opts{$k} = "";
-    }
+while( my($k,$v) = each %config ) {
+    $config{$k} = "" unless defined $v;
 }
+
+if( $config{description} && $config{description} eq '-' ) {
+    $config{description} = slurp("-");
+}
+
+$config{reporter} ||= $config{user};
 
 my ($fh, $fn) = File::Temp::tempfile("jiraXXXXXX",
   SUFFIX => ".yml",
@@ -43,27 +56,44 @@ my ($fh, $fn) = File::Temp::tempfile("jiraXXXXXX",
 );
 
 print $fh <<EOM;
-summary: $opts{summary}
+summary: $config{summary}
 --- | # description on next line
-$opts{description}
+$config{description}
 ---
-project: $opts{project}
-component: $opts{component}
-issuetype: $opts{type}
-assignee: $opts{user}
-reporter: $opts{user}
+project: $config{project}
+component: $config{component}
+issuetype: $config{type}
+assignee: $config{assignee}
+reporter: $config{reporter}
+
+# Priority Values: Blocker Critical Major Minor Trivial Watch unassigned
+priority: $config{priority}
 EOM
 
 close $fh;
 
-my $jira = parse_jira(user_edit_file($fn));
+my $jira;
+while( 1 ) {
+    my $content = user_edit_file($fn);
+    eval {
+        $jira = parse_jira($content);
+    };
+    last unless $@;
+
+    my $error = $@;
+    $error =~ s/^/# ERROR: /gm;
+    open my $fh, ">$fn";
+    print $fh $error;
+    print $fh $content;
+    close $fh;
+}
 
 use Data::Dumper;
 print Dumper $jira;
 
 my $ua = Jira::UserAgent->new(
     cookie_jar => HTTP::Cookies->new(
-        file => "$ENV{HOME}/.$opts{user}-cookies.txt",
+        file => "$ENV{HOME}/.$config{user}-cookies.txt",
         autosave => 1,
     ),
 );
@@ -72,10 +102,11 @@ use JSON::Syck;
 my $headers = HTTP::Headers->new();
 $headers->header("Content-Type" => "application/json");
 $headers->header("Accept" => "application/json");
-my $req = HTTP::Request->new("POST", "$opts{baseuri}/rest/api/2/issue", $headers, JSON::Syck::Dump($jira));
+my $req = HTTP::Request->new("POST", "$config{baseuri}/rest/api/2/issue", $headers, JSON::Syck::Dump($jira));
 print "REQUEST:\n";
 print $req->as_string;
 
+exit if $opts{dryrun};
 my $resp = $ua->request($req);
 # need to log in (ie set Basic Auth headers)
 if( $resp->is_error && $resp->header("X-AUSERNAME") eq 'anonymous' ) {
@@ -89,12 +120,12 @@ if( $resp->is_error && $resp->header("X-AUSERNAME") eq 'anonymous' ) {
 print "RESPONSE:\n";
 print $resp->as_string;
 
-# should get somethign like: {"id":"12345","key":"PROJECT-123","self":"http://jira/rest/api/2/issue/12345"}
+# should get something like: {"id":"12345","key":"PROJECT-123","self":"http://jira/rest/api/2/issue/12345"}
 my $issue = $resp->decoded_content;
 
 my $data = JSON::Syck::Load($issue);
 
-print "OK: $data->{key} [$opts{baseuri}/browse/$data->{key}]\n";
+print "OK: $data->{key} [$config{baseuri}/browse/$data->{key}]\n";
 
 
 # give content that represents a jira in YAML format, convert it to a hash ref
@@ -125,6 +156,7 @@ sub parse_jira {
       assignee   => '{ "name" => "%s" }',
       reporter   => '{ "name" => "%s" }',
       issuetype  => '{ "name" => "%s" }',
+      priority   => '{ "name" => "%s" }',
       project    => '{ "key" => "%s" }',
       component  => ["components" => '[ { "name" => "%s" } ]'],
       summary => '"%s"',
@@ -134,6 +166,10 @@ sub parse_jira {
   for my $key ( keys %jira ) {
       my $fmt = $formats{$key};
       die "format for $key not found\n" unless $fmt;
+      unless(defined $jira{$key}) {
+          delete $jira{$key};
+          next;
+      }
       if( ref($fmt) eq 'ARRAY') {
           my $val = delete $jira{$key};
           $jira{$fmt->[0]} = eval sprintf($fmt->[1], $val);
@@ -151,13 +187,18 @@ sub user_edit_file {
 
   my $digest_before = Digest::MD5::md5_hex(slurp($file));
 
-  my $editor = $ENV{EDITOR} || "vi";
-  my $ret = system($editor, $file);
-  if ($ret != 0) {
-    die "Aborting: $editor $file returned $ret\n";
+  my $editor = $config{editor};
+  unless( defined $opts{edit} && !$opts{edit} ) {
+      my $ret = system($editor, $file);
+      if ($ret != 0) {
+          die "Aborting: $editor $file returned $ret\n";
+      }
   }
 
   my $contents = slurp($file);
+  
+  return $contents if defined $opts{edit} && !$opts{edit};
+
   if (Digest::MD5::md5_hex($contents) eq $digest_before) {
     die "Aborting: unchanged file\n";
   }
@@ -188,7 +229,7 @@ use Cwd;
 use File::Basename;
 
 sub load_configs {
-    my $opts = shift;
+    my $config = shift;
     my $dir = cwd();
     my @configs = ();
     while( $dir ne '/' ) {
@@ -200,7 +241,7 @@ sub load_configs {
     for my $c ( reverse @configs ) {
         my $conf = -x $c ? YAML::Syck::Load(qx{$c}) : YAML::Syck::LoadFile($c);
         for my $key ( %$conf ) {
-            $opts->{$key} = $conf->{$key};
+            $config->{$key} = $conf->{$key};
         }
     }
 }
@@ -211,7 +252,7 @@ use MIME::Base64;
 
 sub auth {
     my ($self, $req) = @_;
-    my $user = $opts{user};
+    my $user = $config{user};
     my $pass = password();
     my $encoded = MIME::Base64::encode_base64("$user:$pass");
     $req->header("Authorization" => "Basic $encoded");
@@ -243,7 +284,7 @@ sub password {
         };
         Term::ReadKey::ReadMode("noecho", $out);
     }
-    print $out "Jira Password [$opts{user}]: ";
+    print $out "Jira Password [$config{user}]: ";
     my $pass = <$in>;
     $CLEANUP[-1]->();
     print $out "\n";
