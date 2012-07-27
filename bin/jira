@@ -120,12 +120,18 @@ if( $resp->is_error && $resp->header("X-AUSERNAME") eq 'anonymous' ) {
 print "RESPONSE:\n";
 print $resp->as_string;
 
-# should get something like: {"id":"12345","key":"PROJECT-123","self":"http://jira/rest/api/2/issue/12345"}
-my $issue = $resp->decoded_content;
+if( $resp->is_error ) {
+    print "ERROR: ", $resp->decoded_content, "\n";
+    exit 1;
+}
+else {
+    # should get something like: {"id":"12345","key":"PROJECT-123","self":"http://jira/rest/api/2/issue/12345"}
+    my $issue = $resp->decoded_content;
+    my $data = JSON::Syck::Load($issue);
+    print "OK: $data->{key} [$config{baseuri}/browse/$data->{key}]\n";
+}
 
-my $data = JSON::Syck::Load($issue);
-
-print "OK: $data->{key} [$config{baseuri}/browse/$data->{key}]\n";
+exit;
 
 
 # give content that represents a jira in YAML format, convert it to a hash ref
@@ -153,28 +159,28 @@ sub parse_jira {
   }
 
   my %formats = (
-      assignee   => '{ "name" => "%s" }',
-      reporter   => '{ "name" => "%s" }',
-      issuetype  => '{ "name" => "%s" }',
-      priority   => '{ "name" => "%s" }',
-      project    => '{ "key" => "%s" }',
-      component  => ["components" => '[ { "name" => "%s" } ]'],
-      summary => '"%s"',
-      description => '"%s"',
+      assignee    => sub { return { "name" => shift } },
+      reporter    => sub { return { "name" => shift } },
+      issuetype   => sub { return { "name" => shift } },
+      priority    => sub { return { "name" => shift } },
+      project     => sub { return { "key" => shift } },
+      component   => ["components" => sub { return [ { "name" => shift } ] }],
+      summary     => sub { return shift },
+      description => sub { return shift },
   );
 
   for my $key ( keys %jira ) {
       my $fmt = $formats{$key};
-      die "format for $key not found\n" unless $fmt;
+      die "formatter for $key not found\n" unless $fmt;
       unless(defined $jira{$key}) {
           delete $jira{$key};
           next;
       }
       if( ref($fmt) eq 'ARRAY') {
           my $val = delete $jira{$key};
-          $jira{$fmt->[0]} = eval sprintf($fmt->[1], $val);
+          $jira{$fmt->[0]} = $fmt->[1]->($val);
       } else {
-          $jira{$key} = eval sprintf($fmt, $jira{$key});
+          $jira{$key} = $fmt->($jira{$key})
       }
   }
   return { fields => \%jira };
